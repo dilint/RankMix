@@ -1,2 +1,4 @@
 simclr/all_patches.csv
 datasets
+*.pyc
+weights/

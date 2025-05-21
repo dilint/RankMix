@@ -24,11 +24,11 @@ from sklearn.metrics import auc, precision_recall_curve
 from sklearn.model_selection import train_test_split
 from sklearn.datasets import load_svmlight_file 
 
-from dataset import ClassDataset, get_sampling_probabilities, get_combo_loader
+from dataset import ClassDataset, get_sampling_probabilities, get_combo_loader, C16Dataset
 from dataset_frmil import FrmilClassDataset
 from train_mil import FeatMag
 from samplers import CategoriesSampler
-from utils import load_model, print_result
+from utils import load_model, print_result, multi_class_scores_mtl, save_metrics_to_excel
 
 def mixup_features(features_pair: Tuple[torch.Tensor, torch.Tensor],
         lam: float,
@@ -492,17 +492,16 @@ def test(test_loader, milnet, criterion, optimizer, args):
     Tensor = torch.cuda.FloatTensor
     with torch.no_grad():        
         for i, batch in enumerate(test_loader): 
-            if args.model=='dsmil':
-                label, feats = batch
-                label, feats = label.cuda().float(), feats.view(-1, args.feats_size).cuda()            
-                ins_prediction, bag_prediction, _, _ = milnet(feats)
-                
-            elif args.model=='frmil':
+            if args.model=='frmil':
                 feats, label, _  = batch
                 feats, label = feats.cuda(), label.cuda().float()           
                 bag_prediction, ins_prediction  = milnet(feats)
                 ins_prediction = ins_prediction.squeeze(0)
-
+            
+            else:
+                label, feats = batch
+                label, feats = label.cuda().float(), feats.view(-1, args.feats_size).cuda()            
+                ins_prediction, bag_prediction, _, _ = milnet(feats)
             max_prediction, _ = torch.max(ins_prediction, 0)
             
             bag_loss = criterion(bag_prediction.view(1, -1), label.view(1, -1))            
@@ -558,6 +557,11 @@ def test(test_loader, milnet, criterion, optimizer, args):
         bag_score = np.array_equal(test_labels[i], test_predictions[i]) + bag_score         
     avg_05_score = bag_score / len(test_loader.dataset)
 
+    ######################### custome metrics #########################
+    roc_auc, accuracies, recalls, precisions, fscores, cancer_matrix, microbial_matrix = multi_class_scores_mtl(test_labels, test_predictions, args.class_labels, threshold=0.5)
+    output_excel_path = os.path.join(args.save_path, 'metrics.xlsx')
+    save_metrics_to_excel(roc_auc, accuracies, recalls, precisions, fscores, cancer_matrix, microbial_matrix, args.class_labels, output_excel_path)
+    ######################### end #########################
     return total_loss / len(test_loader.dataset), avg_score, auc_value, thresholds_optimal, avg_05_score, prauc_value
 
 def multi_label_roc(labels, predictions, num_classes, pos_label=1):
@@ -599,9 +603,10 @@ def optimal_thresh(fpr, tpr, thresholds, p=0):
 def main():
     parser = argparse.ArgumentParser(description='Train DSMIL on 20x patch features learned by SimCLR')
     parser.add_argument('--num_classes', default=2, type=int, help='Number of output classes [2]')
-    parser.add_argument('--feats_size', default=512, type=int, help='Dimension of the feature size [512]')
+    parser.add_argument('--feats_size', default=1536, type=int, help='Dimension of the feature size [512]')
     parser.add_argument('--n_heads', default=8, type=int, help='the number of heads for self-attention')
     parser.add_argument('--sampling', type=str, default='instance', help='sampling mode (instance, class, sqrt, prog)')
+    parser.add_argument('--model_path', type=str)
     parser.add_argument('--do_mixup', type=float, default=0.1, help='mixup coeff (so far only for multi-class')    
     parser.add_argument('--mix_algorithm', type=str, default='mixup', help='do mixup or cutmix')
     parser.add_argument('--mix_domain', type=str, default='feature', help='do mixup in feature/image domain')
@@ -611,8 +616,8 @@ def main():
     parser.add_argument('--lr', default=0.0002, type=float, help='Initial learning rate [0.0002]')
     parser.add_argument('--num_epochs', default=200, type=int, help='Number of total training epochs [40|200]')
     parser.add_argument('--gpu_index', type=int, nargs='+', default=(0,), help='GPU ID(s) [0]')
-    parser.add_argument('--weight_decay', default=5e-3, type=float, help='Weight decay [5e-3]')
-    parser.add_argument('--dataset', default='TCGA-lung-default', type=str, help='Dataset folder name')
+    parser.add_argument('--weight_decay', default=1e-5, type=float, help='Weight decay [5e-3]')
+    parser.add_argument('--dataset', default='gc_10k', type=str, help='Dataset folder name')
     parser.add_argument('--dataset_dir', type=str, default='dataset', help='Dataset directory')
     parser.add_argument('--split', default=0.2, type=float, help='Training/Validation split [0.2]')
     parser.add_argument('--model', default='dsmil', type=str, help='MIL model [dsmil]')
@@ -631,20 +636,29 @@ def main():
     gpu_ids = tuple(args.gpu_index)
     os.environ['CUDA_VISIBLE_DEVICES']=','.join(str(x) for x in gpu_ids)
     
-    if args.model == 'dsmil':
-        import dsmil as mil
-    elif args.model == 'abmil':
-        import abmil as mil
-    elif args.model == 'frmil':
+    if args.model == 'frmil':
         from frmil import FRMIL
+        assert 'Not support frmil'
         milnet = FRMIL(args).cuda()
         print("Using FRMIL model!!")
-    
-    if args.mix_domain=='feature' and args.model == 'dsmil':    
+    elif args.model == 'dsmil':       
+        import dsmil as mil
+        print("Using DSMIL model!!")
+
         i_classifier = mil.FCLayer(in_size=args.feats_size, out_size=args.num_classes).cuda()
         b_classifier = mil.BClassifier(input_size=args.feats_size, output_class=args.num_classes, dropout_v=args.dropout_node, nonlinear=args.non_linearity).cuda()
         milnet = mil.MILNet(i_classifier, b_classifier).cuda()
-    
+    else:
+        from model import MIL
+        import dsmil as dsmil
+        i_classifier = dsmil.FCLayer(in_size=args.feats_size, out_size=args.num_classes).cuda()
+        b_classifier = MIL(input_dim=args.feats_size,
+            mlp_dim=512,
+            n_classes=args.num_classes,
+            mil=args.model,
+            dropout=0.25).cuda()
+        milnet = dsmil.MILNetv2(i_classifier, b_classifier).cuda()
+        
     milnet_test =  milnet
 
     if args.top_k != 'min':
@@ -652,10 +666,11 @@ def main():
         print("Testing differemt top_k number:", args.top_k)
     else:
         save_path = f"{args.dataset}_{args.model}_{args.loss}_{args.mix_algorithm}_{args.mix_domain}"
-
     # Load pretrained model
     if args.pretrain:
-        milnet = load_model(milnet, args.dataset, args.model, loss=args.loss)
+        print("Loading the pretrain model from:", args.model_path)
+        state_dict_weights = torch.load(args.model_path)    
+        milnet.load_state_dict(state_dict_weights)
         save_path = save_path + "_pretrain"
 
 
@@ -665,64 +680,53 @@ def main():
         f"{save_path}_{args.mix_strategy}", 
         datetime.datetime.today().strftime("%Y%m%d_%H%M%S")
     )
-    
+    args.save_path = save_path
         
     os.makedirs(save_path, exist_ok=True)
     log_filename = os.path.join(save_path, 'log.txt')    
     print(f"log_filename: {log_filename}")    
     criterion = nn.BCEWithLogitsLoss()
     
-    optimizer = torch.optim.Adam(milnet.parameters(), lr=args.lr, betas=(0.5, 0.9), weight_decay=args.weight_decay)
+    # optimizer = torch.optim.Adam(milnet.parameters(), lr=args.lr, betas=(0.5, 0.9), weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(milnet.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.num_epochs, 0.000005)
     
-    if args.dataset.startswith("C16_dataset"):
-        bags_csv = os.path.join('datasets', args.dataset, 'training', 'training.csv')    
-    else:
-        bags_csv = os.path.join('datasets', args.dataset, args.dataset+'.csv')
-        print("Loading bags_csv:", bags_csv)    
-        bags_path = pd.read_csv(bags_csv)
-    
-    if args.dataset.startswith("C16_dataset"):        
-        train_path = pd.read_csv(os.path.join('datasets', args.dataset, 'training', 'training.csv'))
-        test_path = pd.read_csv(os.path.join('datasets', args.dataset, 'testing', 'testing.csv'))
-        reference_csv = pd.read_csv(
-            os.path.join('..', args.dataset_dir, 'C16_dataset', 'testing', 'reference.csv'),
-            names=['slide_name', 'label'],
-            usecols=[0, 1],
-            index_col=False
-        )        
+    ################# custome dataset #################
+    id2label = {
+    0: 'nilm',
+    1: 'ascus',
+    2: 'asch',
+    3: 'lsil',
+    4: 'hsil',
+    5: 'agc',
+    6: 't',
+    7: 'm',
+    8: 'bv',}
+    label2id = {v: k for k, v in id2label.items()}
+    if args.dataset == 'gc_10k':
+        args.train_label_path = '/data/wsi/TCTGC10k-labels/9_labels/TCTGC10k-v15-train.csv'
+        args.test_label_path = '/data/wsi/TCTGC10k-labels/9_labels/TCTGC10k-v15-test.csv'
+        # args.dataset_root = '/data/wsi/TCTGC10k-features/gigapath-coarse'
+        args.dataset_root = '/data/wsi/TCTGC10k-features/gigapath-1000'
         
-        reference_csv['label'] = reference_csv['label'].replace({'Tumor':1, 'Normal':0})       
-        test_path = test_path.sort_values(by=['0'], ignore_index=True)
-        test_path['label'] = reference_csv['label']
+        args.num_classes = 9
+        args.class_labels = ['nilm', 'ascus', 'asch', 'lsil', 'hsil', 'agc', 't', 'm', 'bv']
+        df_train = pd.read_csv(args.train_label_path)
+        train_wsi_names = df_train['wsi_name'].values
+        train_wsi_labels = df_train['wsi_label'].map(label2id).values
+        df_test = pd.read_csv(args.test_label_path)
+        test_wsi_names = df_test['wsi_name'].values
+        test_wsi_labels = df_test['wsi_label'].map(label2id).values
+        train_dataset = C16Dataset(train_wsi_names, train_wsi_labels,root=args.dataset_root)
+        val_dataset = C16Dataset(test_wsi_names,test_wsi_labels,root=args.dataset_root)
+        test_dataset = C16Dataset(test_wsi_names,test_wsi_labels,root=args.dataset_root)
+    ################# end #################
 
-        print(f"Loading training set: {os.path.join('datasets', args.dataset, 'training', 'training.csv')}")  
-        print(f"Loading testing set: {os.path.join('datasets', args.dataset, 'testing', 'testing.csv')}")         
-        train_class_count = np.unique(train_path.iloc[:,1], return_counts=True)[1]       
-        print(f"# of positive samples in training set: {train_class_count[1]}/{train_path.shape[0]}")         
-        test_class_count = np.unique(test_path.iloc[:,1], return_counts=True)[1]        
-        print(f"# of positive samples in testing set: {test_class_count[1]}/{test_path.shape[0]}") 
-    else:    
-        train_path = bags_path.iloc[0:int(len(bags_path)*(1-args.split)), :]
-        test_path = bags_path.iloc[int(len(bags_path)*(1-args.split)):, :] 
-    
-    if args.model=="dsmil":
-        train_dataset = ClassDataset(train_path, args)
-        test_dataset = ClassDataset(test_path, args)            
-        val_dataset = train_dataset
-    elif args.model=="frmil":            
-        train_dataset = FrmilClassDataset(df=train_path, mode='train', num_classes=args.num_classes, batch=True)            
-        test_dataset  = FrmilClassDataset(df=test_path, mode='test', num_classes=args.num_classes)
-        val_dataset   = FrmilClassDataset(df=train_path, mode='train', num_classes=args.num_classes) 
-        train_sampler = CategoriesSampler(train_dataset.labels, n_batch=len(train_dataset), n_cls=2, n_per=1)  
-
-    if args.model=="dsmil":
-        train_loader = DataLoader(dataset=train_dataset, batch_size=1, num_workers=args.num_workers, pin_memory=torch.cuda.is_available(), shuffle=True, drop_last=False)
-    elif args.model=="frmil":
-        train_loader = DataLoader(dataset=train_dataset, batch_sampler=train_sampler, num_workers=args.num_workers, pin_memory=torch.cuda.is_available(), drop_last=False)
+    train_loader = DataLoader(dataset=train_dataset, batch_size=1, num_workers=args.num_workers, pin_memory=torch.cuda.is_available(), shuffle=True, drop_last=False)
+    # elif args.model=="frmil":
+    #     train_loader = DataLoader(dataset=train_dataset, batch_sampler=train_sampler, num_workers=args.num_workers, pin_memory=torch.cuda.is_available(), drop_last=False)
     val_loader = DataLoader(dataset=val_dataset, batch_size=1, num_workers=args.num_workers, pin_memory=torch.cuda.is_available(), drop_last=False)
     test_loader = DataLoader(dataset=test_dataset, batch_size=1, num_workers=args.num_workers, pin_memory=torch.cuda.is_available(), drop_last=False)
-    
     
     if args.model != "frmil":        
         train_loader = get_combo_loader(train_loader, base_sampling=args.sampling)
@@ -739,33 +743,29 @@ def main():
         origin_loss_bag, origin_avg_score, origin_aucs, origin_thresholds_optimal, origin_avg_05_score, origin_praucs = test(test_loader, milnet, criterion, optimizer, args)
         print_result(origin_avg_score, origin_avg_05_score, origin_aucs, origin_praucs, result_type='Pretrain', dataset=args.dataset)
 
-    for epoch in range(1, args.num_epochs):    
+    for epoch in range(args.num_epochs):    
         start = time.time()        
         if args.model == 'frmil':
             train_loss_bag = train_frmil(train_loader, milnet, pretrained_milnet, criterion, optimizer, args) # iterate all bags            
         else:
             train_loss_bag = train(train_loader, milnet, pretrained_milnet, criterion, optimizer, args) # iterate all bags
-       
-
-        val_loss_bag, val_avg_score, val_aucs, val_thresholds_optimal, val_avg_05_score, val_praucs = test(val_loader, milnet_test, criterion, optimizer, args)
+         
         test_loss_bag, avg_score, aucs, thresholds_optimal, avg_05_score, praucs = test(test_loader, milnet_test, criterion, optimizer, args)
         if args.dataset=='Lung':
             output_string = (
-                '\r Epoch [%d/%d] time: %.4f train loss: %.4f, val loss: %.4f, val acc: %.4f, test loss: %.4f, test acc: %.4f, test 0.5 acc: %.4f, val_auc_LUAD: %.4f, val_auc_LUSC: %.4f, auc_LUAD: %.4f, auc_LUSC: %.4f, val_prauc_LUAD: %.4f, val_prauc_LUSC: %.4f, prauc_LUAD: %.4f, prauc_LUSC: %.4f' %
-                (epoch, args.num_epochs, time.time()-start, train_loss_bag, val_loss_bag, val_avg_score, test_loss_bag, avg_score, avg_05_score, val_aucs[0], val_aucs[1], aucs[0], aucs[1], val_praucs[0], val_praucs[1], praucs[0], praucs[1])
-            )            
+                '\r Epoch [%d/%d] time: %.4f train loss: %.4f , test loss: %.4f, test acc: %.4f, test 0.5 acc: %.4f, auc_LUAD: %.4f, auc_LUSC: %.4f, prauc_LUAD: %.4f, prauc_LUSC: %.4f' % 
+                (epoch, args.num_epochs, time.time()-start, train_loss_bag, test_loss_bag, avg_score, avg_05_score, aucs[0], aucs[1], praucs[0], praucs[1])
+            )           
         else: 
             output_string = (
-                '\r Epoch [%d/%d] time: %.4f train loss: %.4f, val loss: %.4f, val_acc: %.4f, test loss: %.4f, test acc: %.4f, test 0.5 acc: %.4f, val_AUC: ' % 
-                (epoch, args.num_epochs, time.time()-start, train_loss_bag, val_loss_bag, val_avg_score, test_loss_bag, avg_score, avg_05_score) 
-                + '|'.join('class-{}>>{:.4f}'.format(*k) for k in enumerate(val_aucs))
+                '\r Epoch [%d/%d] time: %.4f train loss: %.4f , test loss: %.4f, test acc: %.4f, test 0.5 acc: %.4f' % 
+                (epoch, args.num_epochs, time.time()-start, train_loss_bag, test_loss_bag, avg_score, avg_05_score) 
                 + ', AUC: '
                 + '|'.join('class-{}>>{:.4f}'.format(*k) for k in enumerate(aucs))
-                + ', val_PRAUC: '
-                + '|'.join('class-{}>>{:.4f}'.format(*k) for k in enumerate(val_praucs))
                 + ', PRAUC: '
                 + '|'.join('class-{}>>{:.4f}'.format(*k) for k in enumerate(praucs))
             )
+
 
         print(output_string)
         with open(log_filename, "a") as log_file:
@@ -773,107 +773,27 @@ def main():
 
         scheduler.step()        
         current_score = (sum(aucs) + avg_score + sum(praucs))/3        
-        current_val_score = (sum(val_aucs) + val_avg_score + sum(val_praucs))/3
         if args.save_all or epoch==args.num_epochs-1:
             torch.save(milnet.state_dict(), os.path.join(save_path, f"checkpoint_{epoch}.pth"))        
         torch.save(milnet.state_dict(), os.path.join(save_path, f"temp.pth"))
 
-        if current_val_score > best_val_score or (current_val_score==best_val_score and val_loss_bag<best_val_loss_bag): 
-            best_val_score = current_val_score             
-            best_val_loss_bag = val_loss_bag
+        save_name = os.path.join(save_path, 'best.pth')
+        torch.save(milnet.state_dict(), save_name)
+        
+        if args.dataset=='Lung':
+            print('Best model saved at: ' + save_name + ' Best thresholds: LUAD %.4f, LUSC %.4f' % (thresholds_optimal[0], thresholds_optimal[1]))
+            with open(log_filename, "a") as log_file:
+                log_file.write('Best model saved at: ' + save_name + ' Best thresholds: LUAD %.4f, LUSC %.4f\n' % (thresholds_optimal[0], thresholds_optimal[1]))
+        else:
+            print('Best model saved at: ' + save_name)
+            print('Best thresholds ===>>> '+ '|'.join('class-{}>>{}'.format(*k) for k in enumerate(thresholds_optimal)))
+            with open(log_filename, "a") as log_file:
+                log_file.write('Best model saved at: ' + save_name)
+                log_file.write('Best thresholds ===>>> '+ '|'.join('class-{}>>{}'.format(*k) for k in enumerate(thresholds_optimal)) + '\n')
 
-            best_val_aucs = aucs
-            best_val_praucs = praucs
-            best_val_avg_score = avg_score 
-            best_val_avg_05_score = avg_05_score 
-             
-            save_name = os.path.join(save_path, 'best.pth')
-            torch.save(milnet.state_dict(), save_name)
-            
-            
-            if args.dataset=='Lung':
-                print('Best model saved at: ' + save_name + ' Best thresholds: LUAD %.4f, LUSC %.4f' % (thresholds_optimal[0], thresholds_optimal[1]))
-                with open(log_filename, "a") as log_file:
-                    log_file.write('Best model saved at: ' + save_name + ' Best thresholds: LUAD %.4f, LUSC %.4f\n' % (thresholds_optimal[0], thresholds_optimal[1]))
-            else:
-                print('Best model saved at: ' + save_name)
-                print('Best thresholds ===>>> '+ '|'.join('class-{}>>{}'.format(*k) for k in enumerate(thresholds_optimal)))
-                with open(log_filename, "a") as log_file:
-                    log_file.write('Best model saved at: ' + save_name)
-                    log_file.write('Best thresholds ===>>> '+ '|'.join('class-{}>>{}'.format(*k) for k in enumerate(thresholds_optimal)) + '\n')
-    
     # Final Result
-    if args.dataset=='Lung':        
-        result_string1 = f"The Val Model: ACC {best_val_avg_score:.4f} | ACC05 {best_val_avg_05_score:.4f} |auc_LUAD: {best_val_aucs[0]:.4f}/{best_val_praucs[0]:.4f}, auc_LUSC: {best_val_aucs[1]:.4f}/{best_val_praucs[1]:.4f}"
-        result_string2 = f"The Last Model: ACC {avg_score:.4f} | ACC05 {avg_05_score:.4f} |auc_LUAD: {aucs[0]:.4f}/{praucs[0]:.4f}, auc_LUSC: {aucs[1]:.4f}/{praucs[1]:.4f}"
-        
-    else:               
-        result_string1 = f"The Val Model: ACC {best_val_avg_score:.4f} | ACC05 {best_val_avg_05_score:.4f} | AUC {best_val_aucs[0]:.4f}/{best_val_praucs[0]:.4f}"
-        result_string2 = f"The Last Model: ACC {avg_score:.4f} | ACC05 {avg_05_score:.4f} | AUC {aucs[0]:.4f}/{praucs[0]:.4f}"
-        
-    print(result_string1)
-    print(result_string2)
-    with open(log_filename, "a") as log_file:
-        log_file.write(result_string1 + '\n')
-        log_file.write(result_string2 + '\n')
     
-    if args.top_k != 'min':
-        csv_path = os.path.join('weights', f'results_{args.dataset}_topk.csv')
-    else:
-        csv_path = os.path.join('weights', f'results_{args.dataset}_{args.num_classes}class.csv')
     
-    if os.path.exists(csv_path):
-        fp = open(csv_path, 'a')
-    elif args.dataset=='Lung':
-        fp = open(csv_path, 'w')
-        fp.write('method,epoch,fix_score_function,dropout,val_acc,acc,val_acc05,acc05,val_auc_LUAD,auc_LUAD,val_auc_LUSC,auc_LUSC,threshold_LUAD,threshold_LUSC,val_prauc_LUAD,prauc_LUAD,val_prauc_LUSC,prauc_LUSC\n')
-    elif args.num_classes==1:
-        fp = open(csv_path, 'w')        
-        fp.write('method,epoch,fix_score_function,dropout,val_acc,acc,val_acc05,acc05,val_auc,auc,threshold,val_prauc,prauc\n')
-    elif args.num_classes==2:
-        fp = open(csv_path, 'w')        
-        fp.write('method,epoch,fix_score_function,dropout,val_acc,acc,val_acc05,acc05,val_auc[0],auc[0],val_auc[1],auc[1],threshold[0],threshold[1],val_prauc[0],prauc[0],val_prauc[1],prauc[1]\n')
-
-    method_name = save_path.split('/')[1]
-    print(f"Saving {method_name}....")    
-    
-    fix_score_function = args.fix_score_function if args.fix_score_function else '-'
-    if args.pretrain:
-        if args.num_classes==1:
-            fp.write(f'{method_name}_origin,x,x,-,'
-            f'{origin_avg_score:.4f},x,'    
-            f'{origin_avg_05_score:.4f},x,'     
-            f'{origin_aucs[0]:.4f},x,'        
-            f'{origin_thresholds_optimal[0]:.4f},'
-            f'{origin_praucs[0]:.4f},x\n')
-        elif args.num_classes==2:
-            fp.write(f'{method_name}_origin,x,x,-,'
-            f'{origin_avg_score:.4f},x,'  
-            f'{origin_avg_05_score:.4f},x,'       
-            f'{origin_aucs[0]:.4f},x,'
-            f'{origin_aucs[1]:.4f},x,'
-            f'{origin_thresholds_optimal[0]:.4f},{origin_thresholds_optimal[1]:.4f},'
-            f'{origin_praucs[0]:.4f},x,'
-            f'{origin_praucs[1]:.4f},x\n')
-
-    if args.num_classes==1:
-        fp.write(f'{method_name},{epoch},{fix_score_function},{args.dropout_input},'
-        f'{best_val_avg_score:.4f},{avg_score:.4f},'    
-        f'{best_val_avg_05_score:.4f},{avg_05_score:.4f},'     
-        f'{best_val_aucs[0]:.4f},{aucs[0]:.4f},'        
-        f'{thresholds_optimal[0]:.4f},'
-        f'{best_val_praucs[0]:.4f},{praucs[0]:.4f}\n')
-    elif args.num_classes==2:
-        fp.write(f'{method_name},{epoch},{fix_score_function},{args.dropout_input},'
-        f'{best_val_avg_score:.4f},{avg_score:.4f},'  
-        f'{best_val_avg_05_score:.4f},{avg_05_score:.4f},'       
-        f'{best_val_aucs[0]:.4f},{aucs[0]:.4f},'
-        f'{best_val_aucs[1]:.4f},{aucs[1]:.4f},'
-        f'{thresholds_optimal[0]:.4f},{thresholds_optimal[1]:.4f},'
-        f'{best_val_praucs[0]:.4f},{praucs[0]:.4f},'
-        f'{best_val_praucs[1]:.4f},{praucs[1]:.4f}\n')
-
-    fp.close()
     print()
 
 if __name__ == '__main__':

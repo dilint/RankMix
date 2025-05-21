@@ -17,29 +17,30 @@
 # ------------------- DSMIL ------------------- #
 # C16_dataset_c16_low99_v0
 rank_strategy=rank
-python train_mil_rankmix.py --dataset="C16_dataset_c16_low99_v0" \
-    --model "dsmil" \
+python train_mil_rankmix.py --dataset="gc_10k" \
+    --model "abmil" \
     --mix_algorithm 'mixup' \
     --mix_domain 'feature' \
     --mix_strategy "${rank_strategy}" \
-    --num_classes=1 --gpu_index 0 \
+    --num_classes=9 --gpu_index 0 \
     --fix_score_function 'finetune'\
-    --pretrain
+    # --pretrain \
+    # --model_path '/home/huangjialong/projects/WsiMixup/RankMix/weights/gc_10k_abmil_9class_dropout_0.2/20250514_162758/checkpoint_39.pth'
 
 # ------------------- FR-MIL ------------------- #
 # (C16_dataset_c16_low99_v0, 10.17, num_classes=1)
-rank_strategy=rank
-python train_mil_rankmix.py --dataset="C16_dataset_c16_low99_v0" \
-    --model "frmil" \
-    --loss "FrmilLoss"  \
-    --mag 10.17 \
-    --mix_algorithm 'mixup' \
-    --mix_domain 'feature' \
-    --mix_strategy "${rank_strategy}" \
-    --num_classes=1 --gpu_index 0\
-    --num_workers 4 \
-    --fix_score_function 'finetune'\
-    --pretrain
+# rank_strategy=rank
+# python train_mil_rankmix.py --dataset="C16_dataset_c16_low99_v0" \
+#     --model "frmil" \
+#     --loss "FrmilLoss"  \
+#     --mag 10.17 \
+#     --mix_algorithm 'mixup' \
+#     --mix_domain 'feature' \
+#     --mix_strategy "${rank_strategy}" \
+#     --num_classes=1 --gpu_index 0\
+#     --num_workers 4 \
+#     --fix_score_function 'finetune'\
+#     --pretrain
     
     
       

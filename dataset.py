@@ -47,6 +47,8 @@ class ClassDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+
+
 class ClassDatasetRemix(Dataset):
     def __init__(self, feats, labels, args, mode='train', transforms=None, test=False):        
         self.feats = feats
@@ -55,6 +57,7 @@ class ClassDatasetRemix(Dataset):
         self.mode = mode            
         self.transforms = transforms
 
+        
         if self.mode == 'train':
             self.feats = torch.Tensor(self.feats)
             self.labels = torch.LongTensor(self.labels)
@@ -171,3 +174,84 @@ def get_combo_loader(loader, base_sampling='instance', dataset_type=None):
     balanced_loader = modify_loader(loader, mode='class', dataset_type=dataset_type)
     combo_loader = ComboLoader([imbalanced_loader, balanced_loader])
     return combo_loader
+
+
+class C16Dataset(Dataset):
+
+    def __init__(self, file_name, file_label, root, num_classes=9, persistence=False,keep_same_psize=0):
+        """
+        参数
+            file_name: WSI pt文件名列表
+            file_label: WSI标签列表
+            root: WSI pt文件根目录
+            persistence: 是否将所有pt文件在init()中加载到内存中
+            keep_same_psize: 是否保持每个样本的patch数量一致
+            is_train: 是否为训练集
+        """
+        super(C16Dataset, self).__init__()
+        self.file_name = file_name
+        self.slide_label = file_label
+        self.slide_label = [int(_l) for _l in self.slide_label]
+        self.size = len(self.file_name)
+        self.root = root
+        self.persistence = persistence
+        self.keep_same_psize = keep_same_psize
+        self.num_classes = num_classes
+        self.data = pd.DataFrame({
+            'features': list(self.file_name),  # 将每行特征保存为列表元素
+            'label': self.slide_label
+        })
+        if persistence:
+            self.feats = [ torch.load(os.path.join(root,'pt', _f+'.pt')) for _f in file_name ]
+
+    def __len__(self):
+        return self.size
+    
+    def _pading_tensor(self, tensor):
+        """
+        为[N,M,C]或者[N,C]的tensor进行padding，其中N为不定长，M，C为定长，使其变为[self.keep_same_psize,M,C]
+        参数:
+            tensor: [N,M,C]的tensor
+        返回:
+            padded_tensor: [self.keep_same_psize,M,C]的tensor
+            mask: [self.keep_same_psize, M]的mask，值为0或1，表示是否为有效数据
+        """
+        keep_same_psize = self.keep_same_psize
+        # 获取当前tensor的长度
+        N = tensor.shape[0]
+        # 创建一个1000x25x256的0矩阵
+        padded_tensor = torch.zeros((keep_same_psize, *(tensor.shape[1:]))) 
+        # 创建一个长度为1000的binary mask
+        mask = torch.zeros(keep_same_psize)
+        # 如果N小于1000，填充数据并设置mask
+        if N < keep_same_psize:
+            padded_tensor[:N] = tensor
+            mask[:N] = 1
+        else:  # 如果N大于1000，截断数据并设置mask
+            padded_tensor = tensor[:keep_same_psize]
+            mask = torch.ones(keep_same_psize)
+        if len(tensor.shape) > 2:
+            mask = mask.unsqueeze(-1).expand(-1, padded_tensor.shape[1])
+        return padded_tensor, mask
+    
+    def __getitem__(self, idx):
+        """
+        Args
+        :param idx: the index of item
+        :return: image and its label
+        """
+        if self.persistence:
+            features = self.feats[idx]
+        else:
+            if "pt" in os.listdir(self.root):
+                dir_path = os.path.join(self.root,"pt")
+            else:
+                dir_path = self.root
+            file_path = os.path.join(dir_path, self.file_name[idx]+'.pt')
+            features = torch.load(file_path, map_location='cpu', weights_only=False)
+        mask = torch.ones(len(features))
+        if self.keep_same_psize > 0:
+            features, mask = self._pading_tensor(features)
+        label = int(self.slide_label[idx])
+        label = torch.nn.functional.one_hot(torch.tensor(label), num_classes=self.num_classes)
+        return label.float(), features
